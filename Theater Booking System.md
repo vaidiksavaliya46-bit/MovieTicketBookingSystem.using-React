@@ -50,7 +50,8 @@ Users can register, log in, browse now-showing movies, view movie details, pick 
 | Icons | React Icons | UI iconography |
 | Backend | Node.js | JavaScript runtime that runs the server |
 | Backend framework | Express 5 | REST API framework |
-| Database | MongoDB | Stores movies, theatres, screens, seats, showtimes, users, and admins |
+| Real-time layer | Socket.io | Pushes live booking, payment, seat, and user events from server to the admin dashboard |
+| Database | MongoDB | Stores movies, theatres, screens, seats, showtimes, bookings, payments, users, and admins |
 | ODM | Mongoose | Schema definitions and MongoDB access |
 | Auth | JSON Web Token (JWT) | Issues and verifies login tokens for users and admins |
 | Password security | bcrypt | Hashes passwords before storing them |
@@ -65,7 +66,8 @@ Users can register, log in, browse now-showing movies, view movie details, pick 
 - **Movie details page** — full synopsis, trailer, and available theatres/showtimes for a movie
 - **Interactive seat booking** — live seat map per screen with seat categories (Regular / Premium / VIP), wheelchair-accessible seats, and real-time booked/available status
 - **Authentication** — separate registration & login flows for users and admins, secured with JWT and bcrypt-hashed passwords
-- **Booking flow** — showtime selection → seat selection → payment page → confirmation screen → view in "My Bookings"
+- **Booking flow** — showtime selection → seat selection → payment page → confirmation screen → view in "My Bookings", now backed by real `Booking` and `Payment` records created together in a single API call, with a local-storage fallback if the backend call fails
+- **Live admin dashboard** — bookings, payments, revenue stats, and new user sign-ups update in real time across the Dashboard, Bookings, Payments, Users pages and the Topbar notification bell via Socket.io, with no manual refresh needed
 - **Payments** — card, UPI (scan-to-pay QR code generated on the fly for the exact order amount), and other methods on the Payment page
 - **Digital ticket sharing** — from the Confirmation page, email the ticket via a pre-filled `mailto:` link (auto-filled with the logged-in user's email) or send it straight to WhatsApp by entering a mobile number
 - **User account** — profile and settings pages, booking history
@@ -165,7 +167,9 @@ TheaterBookingSystem/
 │   │
 │   ├── models/                           # Mongoose schemas
 │   │   ├── Admin.js
+│   │   ├── Booking.js                    # Confirmed booking record
 │   │   ├── Movie.js
+│   │   ├── Payment.js                    # Transaction record linked to a Booking
 │   │   ├── Screen.js
 │   │   ├── Seat.js
 │   │   ├── ShowTime.js
@@ -174,7 +178,9 @@ TheaterBookingSystem/
 │   │
 │   ├── controllers/                      # Business logic per resource
 │   │   ├── adminController.js
+│   │   ├── bookingController.js          # Creates Booking + Payment together, emits socket events
 │   │   ├── movieController.js
+│   │   ├── paymentController.js          # Lists payments, aggregates revenue/success-rate stats
 │   │   ├── screenController.js
 │   │   ├── seatController.js
 │   │   ├── showTimeController.js
@@ -183,7 +189,9 @@ TheaterBookingSystem/
 │   │
 │   ├── routes/                           # Express route definitions
 │   │   ├── adminRoutes.js
+│   │   ├── bookingRoutes.js
 │   │   ├── movieRoutes.js
+│   │   ├── paymentRoutes.js
 │   │   ├── screenRoutes.js
 │   │   ├── seatRoutes.js
 │   │   ├── showTimeRoutes.js
@@ -309,14 +317,16 @@ TheaterBookingSystem/
         │   │   └── UserMenu.css
         │   └── ProtectedRoute.jsx            # UserProtectedRoute / AdminProtectedRoute
         │
-        ├── services/                      # Axios wrappers per API resource
+        ├── services/                       # Axios wrappers per API resource
+        │   ├── adminService.js
+        │   ├── bookingService.js             # Create/list bookings, update booking status
         │   ├── movieService.js
-        │   ├── theatreService.js
+        │   ├── paymentService.js             # List payments, fetch aggregated stats
         │   ├── screenService.js
         │   ├── seatService.js
         │   ├── showTimeService.js
-        │   ├── userService.js
-        │   └── adminService.js
+        │   ├── socketService.js              # Socket.io client + subscribeToEvent helper
+        │   └── userService.js
         │
         ├── utils/                         # Helpers
         │   ├── formatDuration.js
@@ -346,7 +356,7 @@ JWT_SECRET=your_own_secret_key_here
 | `MONGO_URI` | MongoDB connection string (local or Atlas) |
 | `JWT_SECRET` | Secret used to sign/verify JWTs for user and admin login. A fallback default exists in code for local testing, but a real secret should always be set |
 
-The client talks to the API at `http://localhost:5000/api/...` (see `client/src/services/*.js`), so keep the backend on port `5000` unless those base URLs are updated to match a different port.
+The client talks to the API at `http://localhost:5000/api/...` (see `client/src/services/*.js`), so keep the backend on port `5000` unless those base URLs are updated to match a different port. The client's `socketService.js` also connects to `http://localhost:5000` directly for the WebSocket connection — keep this in sync with `PORT` as well.
 
 ---
 
@@ -358,8 +368,10 @@ On startup, the server:
 1. Loads environment variables with `dotenv`
 2. Connects to MongoDB via `connectDB()`
 3. Seeds an initial admin account if none exists (`seedInitialAdmins`)
-4. Registers middleware: `cors()`, and JSON/urlencoded body parsing (with a 50 MB limit to accommodate base64 poster/image uploads)
-5. Mounts one router per resource under `/api/...`
+4. Wraps the Express `app` in a raw `http` server and attaches a **Socket.io** instance to it, storing `io` on the app (`app.set("io", io)`) so controllers can broadcast events
+5. Registers middleware: `cors()`, and JSON/urlencoded body parsing (with a 50 MB limit to accommodate base64 poster/image uploads)
+6. Mounts one router per resource under `/api/...`, including `/api/bookings` and `/api/payments`
+7. Starts listening via `server.listen()` (not `app.listen()`) so both HTTP and WebSocket traffic share the same port
 
 ### 6.2 Data Models
 
@@ -370,6 +382,8 @@ On startup, the server:
 | `Screen` | theatreId, screenName, screenType, totalSeats, regularSeats, premiumSeats, vipSeats | A screen inside a theatre |
 | `Seat` | screenId, seatNumber, category, price, isWheelchair, booked | Individual bookable seat |
 | `ShowTime` | movieId, theatreId, screenId, date, time, ticketPrice, status | Links a movie to a screen at a specific date/time |
+| `Booking` | bookingRef (unique), userId, customerName, customerEmail, showId, movieTitle, theatreName, screenName, showDate, showTime, seats[], totalAmount, status (Confirmed/Pending/Cancelled), paymentMethod | Created together with a `Payment` record at checkout |
+| `Payment` | txnId (unique), bookingId, bookingRef, customerName, customerEmail, method, amount, status (Success/Pending/Refunded) | One transaction per booking; feeds the admin revenue/success-rate stats |
 | `User` | (registration/login fields, hashed password) | End customer account |
 | `Admin` | name, email, password (hashed), role | Dashboard administrator, seeded on first boot |
 
@@ -378,6 +392,22 @@ On startup, the server:
 - Passwords for both `User` and `Admin` are hashed with **bcrypt** before saving (`pre("save")` hook)
 - Login issues a **JWT**, signed with `JWT_SECRET`, used to authenticate subsequent requests and protect admin-only frontend routes
 - `matchPassword` methods on the models compare a plaintext password against the stored hash at login time
+
+### 6.4 Real-Time Updates (Socket.io)
+
+The server wraps Express in a raw `http` server and attaches a **Socket.io** instance to it, stored on `app` (`app.set("io", io)`) so any controller can broadcast events. `bookingController` and `adminController` emit events after a database write; the admin frontend listens for them via `services/socketService.js`.
+
+| Event | Emitted when | Consumed by |
+|---|---|---|
+| `booking:created` | A new booking + payment is created at checkout | Dashboard, Bookings page, Topbar notification bell |
+| `booking:updated` | An admin changes a booking's status | Bookings page |
+| `payment:created` | A payment record is created alongside a booking | Dashboard, Payments page, Topbar |
+| `seats:updated` | Seats are marked booked after checkout | Seat map views |
+| `user:registered` | A new user signs up | Users page, Topbar |
+| `user:deleted` / `users:updated` | An admin removes/edits a user | Users page |
+| `operations:updated` | Any booking is added or updated | Dashboard (triggers a stats refetch) |
+
+**Why:** without this, the admin dashboard would need manual polling or a page refresh to see new bookings, payments, or sign-ups. Socket.io pushes the update the moment it happens on the server.
 
 ---
 
@@ -414,7 +444,7 @@ Home → Movies → Movie Details → Select Showtime
 1. **Browse / Search** — `Home.jsx` and `Movies.jsx` fetch and display movies via `movieService`. The shared `Header` component drives search: it holds the query, shows a live filtered dropdown of matching movies, and updates the URL's `?search=` param via `useSearchParams` so `Movies.jsx`/`Home.jsx` and the header stay in sync
 2. **Movie details** — `moviedetails.jsx` fetches a single movie and its showtimes (`showTimeService`), grouped by theatre
 3. **Seat selection** — `SeatBooking.jsx` fetches seats for the chosen screen (`seatService.getSeats`), renders them by category (Regular/Premium/VIP) with wheelchair seats flagged, and lets the user pick seats before submitting a booking (`seatService.bookSeats`)
-4. **Payment** — `Payment.jsx` collects payment details for the selected seats and showtime. For UPI, a QR code (via the `api.qrserver.com` QR generator) is rendered on the fly encoding a `upi://pay` deep link pre-filled with the order amount, so the user scans and pays with any UPI app instead of typing a UPI ID
+4. **Payment** — `Payment.jsx` collects payment details for the selected seats and showtime. For UPI, a QR code (via the `api.qrserver.com` QR generator) is rendered on the fly encoding a `upi://pay` deep link pre-filled with the order amount, so the user scans and pays with any UPI app instead of typing a UPI ID. On confirming payment, it calls `createBookingApi` (`bookingService`) which hits `POST /api/bookings` — this creates the `Booking` **and** its linked `Payment` record together, marks the chosen seats as booked, and broadcasts the change to the admin dashboard over Socket.io in real time. If the API call fails, the flow falls back to storing the booking locally so the user experience isn't blocked
 5. **Confirmation** — `confirmation.jsx` shows the booking summary and lets the user share the digital ticket: **Email** opens a pre-filled `mailto:` link (default email pulled from the logged-in user's local session) with the full ticket details in the body, and **WhatsApp** prompts for a mobile number and opens `wa.me`/`api.whatsapp.com` with the formatted ticket pre-filled
 6. **History** — `MyBookings.jsx` lists the logged-in user's past bookings
 
@@ -424,13 +454,15 @@ Home → Movies → Movie Details → Select Showtime
 
 Reached via a separate `AdminLogin.jsx`, protected independently from the user login. Once authenticated, the admin can:
 
-- **Dashboard** — high-level stats via `DashboardCard` components
+- **Dashboard** — live stats via `DashboardCard` components (revenue, bookings, payments), refreshed instantly over Socket.io whenever a new booking or payment comes in
 - **Movies** — add (`AddMovie.jsx`), edit (`EditMovie.jsx`), list, and delete movies, including poster upload via `MovieForm`
 - **Theatres** — add (`AddTheatre.jsx`), edit (`EditTheatre.jsx`), and list theatres
 - **Screens** — add screens to a theatre and configure seat category counts (`Addscreen.jsx`)
 - **ShowTimes** — schedule a movie on a specific screen/date/time (`AddShowTime.jsx`)
-- **Users** — view registered users
-- **Bookings & Payments** — view booking and payment records
+- **Users** — view registered users, updated live as new accounts register
+- **Bookings** — view all bookings and update a booking's status (Confirmed/Pending/Cancelled), with new bookings appearing in real time
+- **Payments** — view transaction history and aggregated stats (total revenue, success rate, UPI usage %), updated live
+- **Topbar notifications** — a live notification bell that surfaces new bookings, payments, and user sign-ups as they happen, powered by the same Socket.io events as the Dashboard
 
 ---
 
@@ -495,6 +527,28 @@ Base URL: `http://localhost:5000/api`
 | GET | `/admin` | List all admins |
 | DELETE | `/admin/:id` | Delete an admin |
 
+### 10.8 Bookings — `/bookings`
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/bookings` | Create a booking (also creates the linked `Payment`, marks seats booked, and emits `booking:created`/`payment:created`/`seats:updated` socket events) |
+| GET | `/bookings` | List all bookings, newest first (admin use) |
+| PUT | `/bookings/:id` | Update a booking's status (Confirmed/Pending/Cancelled), emits `booking:updated` |
+
+### 10.9 Payments — `/payments`
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/payments` | List all payment transactions, newest first |
+| GET | `/payments/stats` | Aggregated stats: total revenue, transaction count, success rate, UPI usage percentage |
+
+### 10.10 Real-time events (Socket.io, not REST)
+| Event | Description |
+|---|---|
+| `booking:created` / `booking:updated` | A booking was created or its status changed |
+| `payment:created` | A payment transaction was recorded |
+| `seats:updated` | Seats for a show were marked booked |
+| `user:registered` / `user:deleted` / `users:updated` | A user account changed |
+| `operations:updated` | Generic signal to refetch dashboard stats |
+
 ---
 
 ## 11. Running the Project
@@ -542,10 +596,10 @@ Express Route
    │  (matches method + URL to a route file)
    ▼
 Controller
-   │  (runs business logic — e.g. mark seats booked, hash password, sign JWT)
+   │  (runs business logic — e.g. create Booking + Payment, mark seats booked, hash password, sign JWT)
    ▼
 MongoDB (via Mongoose)
-   │  (reads/writes movies, theatres, screens, seats, showtimes, users, admins)
+   │  (reads/writes movies, theatres, screens, seats, showtimes, bookings, payments, users, admins)
    ▼
 Controller Response
    │  (JSON response with status code)
@@ -554,6 +608,23 @@ React UI Update
    │  (state updates, toast/alert shown, page navigates forward)
    ▼
 User sees the updated result — a booked seat, a new movie, a confirmed ticket
+```
+
+### 12.1 Real-time admin path (Socket.io)
+
+```
+Booking/Payment/User controller finishes a write
+   ▼
+io.emit("booking:created" / "payment:created" / "user:registered" / etc.)
+   │  (event broadcast to every connected client)
+   ▼
+Client socketService.js (socket.io-client, connected on app load)
+   │  (subscribeToEvent(eventName, callback) fires the callback)
+   ▼
+Admin Dashboard / Bookings / Payments / Users page / Topbar bell
+   │  (component state updates immediately)
+   ▼
+Admin sees the new booking, payment, or sign-up instantly — no refresh needed
 ```
 
 ---
