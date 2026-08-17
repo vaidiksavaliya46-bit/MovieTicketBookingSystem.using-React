@@ -1,4 +1,4 @@
-# 🎬 Theater Booking System
+# 🎬 Movies Ticket Booking System
 ### A Full-Stack Movie Ticket Booking Platform — React.js + Node.js + Express.js + MongoDB
 
 Welcome! This README is your **complete guide** to understanding, setting up, and running the Theater Booking System — a full-stack web application that lets users browse movies, pick a showtime, select seats on a live seat map, and complete a booking, while admins manage movies, theatres, screens, showtimes, and users from a dedicated dashboard.
